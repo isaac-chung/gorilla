@@ -18,6 +18,14 @@ from client_utils import build_openai_client, build_langchain_embeddings
 from math import ceil
 from format import DatasetConverter, datasetFormats, outputDatasetTypes
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import threading
+from tqdm import tqdm
+
+
+lock = threading.Lock()
+
 log_setup()
 
 logger = logging.getLogger("raft")
@@ -45,7 +53,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--doctype", type=str, default="pdf", help="The type of the document, must be one of the accepted doctypes", choices=["pdf", "txt", "json", "api"])
     parser.add_argument("--openai_key", type=str, default=None, help="Your OpenAI key used to make queries to GPT-3.5 or GPT-4")
     parser.add_argument("--embedding_model", type=str, default="text-embedding-ada-002", help="The embedding model to use to encode documents chunks (text-embedding-ada-002, ...)")
-    parser.add_argument("--completion_model", type=str, default="gpt-4", help="The model to use to generate questions and answers (gpt-3.5, gpt-4, ...)")
+    parser.add_argument("--completion_model", type=str, default="/data/4/huggingface/hub/models--meta-llama--Meta-Llama-3-70B-Instruct/snapshots/7129260dd854a80eb10ace5f61c20324b472b31c", help="The model to use to generate questions and answers (gpt-3.5, gpt-4, ...)")
     parser.add_argument("--fast", action="store_true", help="Run the script in fast mode (no recovery implemented)")
 
     args = parser.parse_args()
@@ -81,6 +89,17 @@ def get_chunks(
         if doctype == "json":
             with open(file_path, 'r') as f:
                 data = json.load(f)
+            
+            ## Special case with HotPotQA
+            if "hotpot" in file_path:
+                contexts = []
+                for ex in data:
+                    contexts.extend([e[1] for e in ex['context']])
+                    if len(contexts) > 2000:
+                        break
+
+                return contexts
+
             text = data["text"]
         elif doctype == "pdf":
             text = ""
@@ -215,8 +234,8 @@ def add_chunk_to_dataset(
     doctype: DocType = "api", 
     x: int = 5, 
     num_distract: int = 3, 
+    model: str = None,
     p: float = 0.8,
-    model: str = None
 ) -> None:
     """
     Given a chunk, create {Q, A, D} triplets and add them to the dataset.
@@ -271,18 +290,19 @@ def add_chunk_to_dataset(
         datapt["instruction"] = context
 
         # add to dataset
-        if not ds:
-            # init ds
-            datapt["id"] = [datapt["id"]]
-            datapt["type"] = [datapt["type"]]
-            datapt["question"] = [datapt["question"]]
-            datapt["context"] = [datapt["context"]]
-            datapt["oracle_context"] = [datapt["oracle_context"]]
-            datapt["cot_answer"] = [datapt["cot_answer"]]
-            datapt["instruction"] = [datapt["instruction"]]
-            ds = Dataset.from_dict(datapt)
-        else:
-            ds = ds.add_item(datapt)
+        with lock:
+            if not ds:
+                # init ds
+                datapt["id"] = [datapt["id"]]
+                datapt["type"] = [datapt["type"]]
+                datapt["question"] = [datapt["question"]]
+                datapt["context"] = [datapt["context"]]
+                datapt["oracle_context"] = [datapt["oracle_context"]]
+                datapt["cot_answer"] = [datapt["cot_answer"]]
+                datapt["instruction"] = [datapt["instruction"]]
+                ds = Dataset.from_dict(datapt)
+            else:
+                ds = ds.add_item(datapt)
 
 def save_checkpoint(state, filename):
     with open(filename, 'w') as f:
@@ -292,9 +312,33 @@ def load_checkpoint(filename):
     with open(filename, 'r') as f:
         return int(f.read())
 
+
+def concurrent_calls(client: OpenAI,
+    chunks: list[str],
+    doctype: DocType = "api",
+    x: int = 5,
+    num_distract: int = 3,
+    model: str = None):
+    num_chunks = len(chunks)
+
+    threads = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for i, chunk in enumerate(chunks):
+            perc = ceil(i / num_chunks * 100)
+            with MDC(progress=f"{perc}%"):
+                logger.info(f"Adding chunk {i}/{num_chunks}")
+                threads.append(
+                    executor.submit(add_chunk_to_dataset, client, chunks, chunk, doctype, x, num_distract, model))
+                time.sleep(0.01)
+
+        for task in tqdm(as_completed(threads), total=len(chunks), desc="Processing requests"):
+            task.result()
+
+
 def main():
     global ds
 
+    logger.info("Start")
     # run code
     args = get_args()
 
@@ -305,6 +349,7 @@ def main():
     OPENAPI_API_KEY = args.openai_key
 
     client = build_openai_client(
+        base_url="http://10.244.5.224:8000/v1",
         api_key=OPENAPI_API_KEY,
     )
 
@@ -349,11 +394,8 @@ def main():
 
         ds = datasets.concatenate_datasets(ds_list)
     else:
-        for i, chunk in enumerate(chunks):
-            perc = ceil(i / num_chunks * 100)
-            with MDC(progress=f"{perc}%"):
-                logger.info(f"Adding chunk {i}/{num_chunks}")
-                add_chunk_to_dataset(client, chunks, chunk, args.doctype, args.questions, NUM_DISTRACT_DOCS, model=args.completion_model)
+        concurrent_calls(client, chunks, args.doctype, args.questions, NUM_DISTRACT_DOCS, model=args.completion_model)
+
     
     # Save as .arrow format
     ds.save_to_disk(args.output)
@@ -373,6 +415,8 @@ def main():
         for filename in os.listdir(os.path.dirname(args.output)):
             if "-checkpoints-" in filename:
                 shutil.rmtree(os.path.dirname(args.output) + "/" + filename)
+
+    logger.info(f"Processed {num_chunks} chunks with {args.questions} questions/chunk.")
 
 if __name__ == "__main__":
     with MDC(progress="0%"):
