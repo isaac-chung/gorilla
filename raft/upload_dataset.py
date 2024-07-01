@@ -4,6 +4,8 @@ from huggingface_hub import upload_file
 
 
 repo = "isaacchung/hotpotqa-dev-raft-subset"
+token= os.environ['HF_TOKEN'] ## write token
+
 
 ## Remember to remove all the `Here is an example question` examples.
 ds = datasets.load_dataset('json', data_files='/home/isaacchung/work/gorilla/data/output/output.chat.jsonl')
@@ -18,5 +20,5 @@ for split, dset in ds.items():
         path_in_repo=save_path,
         repo_id=repo,
         repo_type="dataset",
+        token=token,
     )
-    os.system(f"rm {save_path}")

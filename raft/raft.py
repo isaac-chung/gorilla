@@ -95,7 +95,7 @@ def get_chunks(
                 contexts = []
                 for ex in data:
                     contexts.extend([e[1] for e in ex['context']])
-                    if len(contexts) > 2000:
+                    if len(contexts) > 32000:
                         break
 
                 return contexts
@@ -329,7 +329,7 @@ def concurrent_calls(client: OpenAI,
                 logger.info(f"Adding chunk {i}/{num_chunks}")
                 threads.append(
                     executor.submit(add_chunk_to_dataset, client, chunks, chunk, doctype, x, num_distract, model))
-                time.sleep(0.01)
+                time.sleep(0.1)
 
         for task in tqdm(as_completed(threads), total=len(chunks), desc="Processing requests"):
             task.result()
@@ -349,7 +349,7 @@ def main():
     OPENAPI_API_KEY = args.openai_key
 
     client = build_openai_client(
-        base_url="http://10.244.5.224:8000/v1",
+        base_url="http://10.244.5.201:8000/v1",
         api_key=OPENAPI_API_KEY,
     )
 
